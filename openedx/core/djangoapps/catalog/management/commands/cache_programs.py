@@ -7,7 +7,9 @@ from django.core.cache import cache
 from django.core.management import BaseCommand
 
 from openedx.core.djangoapps.catalog.cache import (
+    CREDIT_PATHWAY_CACHE_KEY_TPL,
     PROGRAM_CACHE_KEY_TPL,
+    SITE_CREDIT_PATHWAY_NAMES_CACHE_KEY_TPL,
     SITE_PROGRAM_UUIDS_CACHE_KEY_TPL
 )
 from openedx.core.djangoapps.catalog.models import CatalogIntegration
@@ -43,21 +45,25 @@ class Command(BaseCommand):
             raise
 
         programs = {}
+        pathways = {}
         for site in Site.objects.all():
             site_config = getattr(site, 'configuration', None)
             if site_config is None or not site_config.get_value('COURSE_CATALOG_API_URL'):
                 logger.info('Skipping site {domain}. No configuration.'.format(domain=site.domain))
                 cache.set(SITE_PROGRAM_UUIDS_CACHE_KEY_TPL.format(domain=site.domain), [], None)
+                cache.set(SITE_CREDIT_PATHWAY_NAMES_CACHE_KEY_TPL.format(domain=site.domain), [], None)
                 continue
 
             client = create_catalog_api_client(user, site=site)
             uuids, program_uuids_failed = self.get_site_program_uuids(client, site)
             new_programs, program_details_failed = self.fetch_program_details(client, uuids)
+            new_pathways, new_programs, pathways_failed = self.get_pathways_update_programs(client, site, new_programs)
 
-            if program_uuids_failed or program_details_failed:
+            if program_uuids_failed or program_details_failed or pathways_failed:
                 failure = True
 
             programs.update(new_programs)
+            pathways.update(new_pathways)
 
             logger.info('Caching UUIDs for {total} programs for site {site_name}.'.format(
                 total=len(uuids),
@@ -65,9 +71,22 @@ class Command(BaseCommand):
             ))
             cache.set(SITE_PROGRAM_UUIDS_CACHE_KEY_TPL.format(domain=site.domain), uuids, None)
 
-        successful = len(programs)
-        logger.info('Caching details for {successful} programs.'.format(successful=successful))
+            pathway_names = new_pathways.keys()
+            logger.info('Caching names for {total} credit pathways for site {site_name}.'.format(
+                total=len(pathway_names),
+                site_name=site.domain,
+            ))
+            cache.set(SITE_CREDIT_PATHWAY_NAMES_CACHE_KEY_TPL.format(domain=site.domain), pathway_names, None)
+
+        successful_programs = len(programs)
+        logger.info('Caching details for {successful_programs} programs.'.format(
+            successful_programs=successful_programs))
         cache.set_many(programs, None)
+
+        successful_pathways = len(pathways)
+        logger.info('Caching details for {successful_pathways} credit pathways.'.format(
+            successful_pathways=successful_pathways))
+        cache.set_many(pathways, None)
 
         if failure:
             # This will fail a Jenkins job running this command, letting site
@@ -104,9 +123,48 @@ class Command(BaseCommand):
                 cache_key = PROGRAM_CACHE_KEY_TPL.format(uuid=uuid)
                 logger.info('Requesting details for program {uuid}.'.format(uuid=uuid))
                 program = client.programs(uuid).get(exclude_utm=1)
+                # pathways get added in get_pathways_update_programs
+                program['pathways'] = []
                 programs[cache_key] = program
             except:  # pylint: disable=bare-except
                 logger.exception('Failed to retrieve details for program {uuid}.'.format(uuid=uuid))
                 failure = True
                 continue
         return programs, failure
+
+    def get_pathways_update_programs(self, client, site, programs):
+        """
+        Adds a new field to each program showing each pathway it is in.
+        Builds a dict mapping each pathway name to its complete object.
+        """
+        pathways = {}
+        failure = False
+        try:
+            logger.info('Requesting credit pathways for {domain}.'.format(domain=site.domain))
+            retrieved_pathways = client.credit_pathways.get(exclude_utm=1)
+
+            for pathway in retrieved_pathways:
+                pathway_name = pathway['name']
+                pathway_cache_key = CREDIT_PATHWAY_CACHE_KEY_TPL.format(name=pathway_name)
+                pathways[pathway_cache_key] = pathway
+                uuids = []
+
+                for program in pathway['programs']:
+                    program_uuid = program['uuid']
+                    program_cache_key = PROGRAM_CACHE_KEY_TPL.format(uuid=program_uuid)
+                    programs[program_cache_key]['pathways'].append(pathway_name)
+                    uuids.append(program_uuid)
+
+                # programs data is already stored in cache, don't duplicate
+                del pathway['programs']
+                pathway['program_uuids'] = uuids
+
+        except:  # pylint: disable=bare-except
+            logger.error('Failed to retrieve credit pathways for site: {domain}.'.format(domain=site.domain))
+            failure = True
+
+        logger.info('Received {total} credit pathways for site {domain}'.format(
+            total=len(pathways),
+            domain=site.domain
+        ))
+        return pathways, programs, failure
