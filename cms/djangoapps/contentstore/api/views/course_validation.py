@@ -113,8 +113,8 @@ class CourseValidationView(DeveloperErrorViewMixin, GenericAPIView):
     def _assignments_validation(self, course, request):
         assignments, visible_assignments = self._get_assignments(course)
         assignments_with_dates = [
-             a for a in visible_assignments if a.due
-         ]
+            a for a in visible_assignments if a.due
+        ]
         assignments_with_dates_before_start = (
             [
                 {'id': unicode(a.location), 'display_name': a.display_name}
